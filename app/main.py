@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -137,6 +138,47 @@ async def rebrick_pipeline(pipeline_id: str, request: RebrickRequest):
         await pipeline_mgr.rebrick(pipeline_id, request.settings)
         return {"status": "started", "message": "Re-conversion started with new settings"}
     except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Camera calibration
+# ──────────────────────────────────────────────────────────────────────
+
+
+class CameraCalibrationRequest(BaseModel):
+    cameras: dict = {}
+    top_up_hint: list[float] | None = None
+    grid_resolution: int = 64
+    consensus_ratio: float = 0.6
+    mask_dilation: int = 15
+
+
+@app.post("/api/pipeline/{pipeline_id}/calibrate_cameras")
+async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest):
+    """Run fast camera calibration preview with overridden camera params."""
+    state = pipeline_mgr.get_pipeline(pipeline_id)
+    if not state:
+        raise HTTPException(404, "Pipeline not found")
+    if not state.gpu_job_id:
+        raise HTTPException(400, "3D reconstruction has not started yet")
+
+    try:
+        result = await gpu_client.calibrate_cameras(
+            state.gpu_job_id,
+            {
+                "cameras": request.cameras,
+                "top_up_hint": request.top_up_hint,
+                "grid_resolution": request.grid_resolution,
+                "consensus_ratio": request.consensus_ratio,
+                "mask_dilation": request.mask_dilation,
+            },
+        )
+        return result
+    except gpu_client.GPUClusterError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:
+        logger.error("Calibration failed for pipeline %s: %s", pipeline_id, e)
         raise HTTPException(500, str(e))
 
 

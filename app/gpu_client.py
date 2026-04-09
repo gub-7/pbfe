@@ -289,3 +289,44 @@ async def download_glb(job_id: str, output_path: str) -> None:
             f"Failed to download GLB from {url}: {e}"
         ) from e
 
+# ──────────────────────────────────────────────────────────────────────
+# Camera calibration
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def calibrate_cameras(job_id: str, params: dict) -> dict:
+    """Run a fast camera calibration preview on the GPU cluster.
+
+    Args:
+        job_id: GPU cluster job ID (must have completed preprocess_views).
+        params: Camera calibration parameters (cameras, top_up_hint, etc.)
+
+    Returns:
+        Dict with preview (base64), depth_maps, overlays, n_occupied, etc.
+
+    Raises:
+        GPUClusterError: If the calibration fails.
+    """
+    url = config.GPU_CLUSTER_URL.rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{url}/api/job/{job_id}/calibrate_cameras",
+                json=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", e.response.text)
+        except Exception:
+            detail = e.response.text
+        raise GPUClusterError(
+            f"Camera calibration failed (HTTP {e.response.status_code}): {detail}"
+        ) from e
+    except httpx.RequestError as e:
+        raise GPUClusterError(
+            f"Could not connect to GPU cluster for calibration: {e}"
+        ) from e
