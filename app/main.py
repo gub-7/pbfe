@@ -85,6 +85,7 @@ async def health():
 @app.post("/api/pipeline/start", response_model=PipelineCreateResponse)
 async def start_pipeline(
     file: UploadFile = File(..., description="Image of subject (corner angle showing ~3 sides)"),
+    debug_alignment: bool = False,
 ):
     """Upload an image and start the full pipeline."""
     allowed = {".png", ".jpg", ".jpeg", ".webp"}
@@ -102,6 +103,7 @@ async def start_pipeline(
         shutil.copyfileobj(file.file, f)
 
     state.input_image_path = str(upload_path)
+    state.debug_alignment = debug_alignment
     logger.info("Pipeline %s: saved upload to %s", state.pipeline_id, upload_path)
 
     pipeline_mgr.start_pipeline(state.pipeline_id)

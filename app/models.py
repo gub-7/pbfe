@@ -52,6 +52,12 @@ class PipelineStatus(BaseModel):
 
     # Metadata from rubric
     rubric_metadata: Optional[dict] = None
+    # Debug alignment previews (incremental reconstruction)
+    debug_previews: dict[str, str] = Field(
+        default_factory=dict,
+        description="Map of view_name → URL for incremental reconstruction debug renders"
+    )
+
 
     error: Optional[str] = None
     created_at: datetime

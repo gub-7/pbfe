@@ -43,6 +43,9 @@ class PipelineState:
         self.rubric_metadata: Optional[dict] = None
         self.brick_settings: BrickSettings = BrickSettings()
 
+        # Debug alignment
+        self.debug_alignment: bool = False
+        self.debug_previews: dict[str, str] = {}
         # Error
         self.error: Optional[str] = None
         self.created_at = datetime.utcnow()
@@ -61,6 +64,7 @@ class PipelineState:
             ldr_ready=self.ldr_path is not None,
             bom_ready=self.bom_path is not None or self.metadata_path is not None,
             rubric_metadata=self.rubric_metadata,
+            debug_previews=self.debug_previews,
             error=self.error,
             created_at=self.created_at,
             updated_at=self.updated_at,
@@ -229,7 +233,14 @@ class PipelineManager:
         )
 
         # Submit to GPU cluster
-        job_id = await gpu_client.submit_multiview_job(state.generated_views)
+        # Pass debug_incremental_recon flag if debug alignment is enabled
+        gpu_params = {}
+        if state.debug_alignment:
+            gpu_params["debug_incremental_recon"] = True
+        job_id = await gpu_client.submit_multiview_job(
+            state.generated_views,
+            params=gpu_params if gpu_params else None,
+        )
         state.update(gpu_job_id=job_id)
 
         # Switch to reconstruction stage
@@ -252,7 +263,18 @@ class PipelineManager:
         # Fetch preprocessing previews (segmentation masks, etc.)
         try:
             previews = await gpu_client.get_preprocessing_previews(job_id)
-            state.update(preprocessing_previews=previews)
+            # Separate debug_recon previews from regular preprocessing previews
+            debug_previews = {}
+            regular_previews = {}
+            for key, url in previews.items():
+                if key.startswith("debug_recon_"):
+                    view_name = key.replace("debug_recon_", "")
+                    debug_previews[view_name] = url
+                else:
+                    regular_previews[key] = url
+            state.update(preprocessing_previews=regular_previews)
+            if debug_previews:
+                state.update(debug_previews=debug_previews)
         except Exception as e:
             logger.warning("Failed to fetch preprocessing previews: %s", e)
 
