@@ -42,7 +42,10 @@ async def check_gpu_health() -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             resp = await client.get(f"{gpu_url}/api/health")
             if resp.status_code == 200:
-                return {"status": "healthy", "url": gpu_url, "detail": resp.json()}
+                data = resp.json()
+                # Pass through the GPU cluster's own status assessment
+                cluster_status = data.get("status", "unknown")
+                return {"status": cluster_status, "url": gpu_url, "detail": data}
             return {"status": "unhealthy", "url": gpu_url, "detail": f"HTTP {resp.status_code}"}
     except httpx.ConnectError:
         return {"status": "unreachable", "url": gpu_url, "detail": f"Cannot connect to GPU cluster at {gpu_url}"}
