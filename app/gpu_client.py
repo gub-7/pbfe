@@ -1,12 +1,21 @@
-"""HTTP client for the GPU Cluster service (5-view → 3D GLB)."""
+"""Client for communicating with the GPU cluster 3D reconstruction service.
+
+Handles multi-view job submission, polling, preview fetching, and
+GLB download.  The GPU cluster exposes a FastAPI service (see
+gpu-cluster/api/main.py) at the URL configured by GPU_CLUSTER_URL.
+
+3-view canonical setup:
+    - front:  perpendicular, centered
+    - side:   perpendicular from the right
+    - top:    bird's-eye looking straight down
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional
 
 import httpx
 
@@ -14,273 +23,269 @@ from .config import config
 
 logger = logging.getLogger("brickedup.gpu_client")
 
-# Maximum retries for transient connection failures
-MAX_CONNECT_RETRIES = 3
-RETRY_BACKOFF_BASE = 2.0  # seconds
+# Canonical view names — must match gpu-cluster/api/models.py ViewName
+CANONICAL_VIEWS = ["front", "side", "top"]
+
+# Polling configuration
+POLL_INTERVAL_SECONDS = 3
+POLL_TIMEOUT_SECONDS = 600  # 10 minutes max
 
 
 class GPUClusterError(Exception):
-    """Raised when the GPU cluster is unreachable or returns an error."""
-    pass
+    """Raised when the GPU cluster returns an error or is unreachable."""
 
 
-async def _check_gpu_reachable() -> bool:
-    """Quick connectivity check to the GPU cluster."""
-    gpu_url = config.GPU_CLUSTER_URL
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            resp = await client.get(f"{gpu_url}/api/health")
-            return resp.status_code == 200
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
-        return False
+# ──────────────────────────────────────────────────────────────────────
+# Health check
+# ──────────────────────────────────────────────────────────────────────
 
 
 async def check_gpu_health() -> dict:
-    """Check GPU cluster health and return status info."""
-    gpu_url = config.GPU_CLUSTER_URL
+    """Check GPU cluster connectivity and health.
+
+    Returns:
+        Dict with keys: status, url, detail.
+    """
+    url = config.GPU_CLUSTER_URL.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            resp = await client.get(f"{gpu_url}/api/health")
-            if resp.status_code == 200:
-                data = resp.json()
-                # Pass through the GPU cluster's own status assessment
-                cluster_status = data.get("status", "unknown")
-                return {"status": cluster_status, "url": gpu_url, "detail": data}
-            return {"status": "unhealthy", "url": gpu_url, "detail": f"HTTP {resp.status_code}"}
-    except httpx.ConnectError:
-        return {"status": "unreachable", "url": gpu_url, "detail": f"Cannot connect to GPU cluster at {gpu_url}"}
-    except httpx.TimeoutException:
-        return {"status": "timeout", "url": gpu_url, "detail": f"GPU cluster at {gpu_url} timed out"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{url}/api/health")
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "status": data.get("status", "healthy"),
+                "url": url,
+                "detail": "",
+            }
     except Exception as e:
-        return {"status": "error", "url": gpu_url, "detail": str(e)}
+        return {
+            "status": "unreachable",
+            "url": url,
+            "detail": str(e),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job submission
+# ──────────────────────────────────────────────────────────────────────
 
 
 async def submit_multiview_job(
-    view_paths: dict[str, str],
+    generated_views: dict[str, str],
     category: str = "generic_object",
     pipeline: str = "canonical_mv_hybrid",
     params: Optional[dict] = None,
 ) -> str:
-    """Upload 5 canonical views to GPU cluster and return job_id.
+    """Submit a multi-view reconstruction job to the GPU cluster.
 
     Args:
-        view_paths: Dict mapping view name -> file path (front, back, left, right, top).
-        category: Object category hint.
-        pipeline: Reconstruction pipeline to use.
-        params: Additional pipeline parameters.
+        generated_views: Dict mapping view name → local file path.
+            Expected keys: front, side, top.
+        category: Object category for reconstruction hints.
+        pipeline: GPU cluster pipeline to use.
+        params: Optional CanonicalMVParams overrides.
 
     Returns:
-        Job ID string.
+        Job ID from the GPU cluster.
 
     Raises:
-        GPUClusterError: If the GPU cluster is unreachable or rejects the request.
+        GPUClusterError: If submission fails.
     """
-    gpu_url = config.GPU_CLUSTER_URL
-    params = params or {
-        "output_resolution": 1024,
-        "mesh_resolution": 256,
-        "texture_resolution": 2048,
+    url = config.GPU_CLUSTER_URL.rstrip("/")
+
+    files = {}
+    for view_name in CANONICAL_VIEWS:
+        path = generated_views.get(view_name)
+        if not path:
+            raise GPUClusterError(
+                f"Missing required view '{view_name}' in generated_views"
+            )
+        filepath = Path(path)
+        if not filepath.exists():
+            raise GPUClusterError(
+                f"View file not found: {path}"
+            )
+        files[view_name] = (
+            filepath.name,
+            open(filepath, "rb"),
+            "image/png",
+        )
+
+    data = {
+        "category": category,
+        "pipeline": pipeline,
     }
+    if params:
+        import json
+        data["params"] = json.dumps(params)
+    else:
+        data["params"] = "{}"
 
-    last_error = None
-
-    for attempt in range(1, MAX_CONNECT_RETRIES + 1):
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
-                files = {}
-                file_handles = []
-                try:
-                    for view_name in ["front", "back", "left", "right", "top"]:
-                        view_path = view_paths.get(view_name)
-                        if not view_path:
-                            raise ValueError(f"Missing {view_name} view")
-                        fh = open(view_path, "rb")
-                        file_handles.append(fh)
-                        files[view_name] = (f"{view_name}.png", fh, "image/png")
-
-                    response = await client.post(
-                        f"{gpu_url}/api/upload_multiview",
-                        files=files,
-                        data={
-                            "category": category,
-                            "pipeline": pipeline,
-                            "params": json.dumps(params),
-                        },
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-                    job_id = result["job_id"]
-                    logger.info("GPU cluster job created: %s", job_id)
-                    return job_id
-
-                finally:
-                    for fh in file_handles:
-                        fh.close()
-
-        except httpx.ConnectError as e:
-            last_error = e
-            if attempt < MAX_CONNECT_RETRIES:
-                wait = RETRY_BACKOFF_BASE ** attempt
-                logger.warning(
-                    "GPU cluster connection failed (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt, MAX_CONNECT_RETRIES, wait, e,
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{url}/api/upload_multiview",
+                files=files,
+                data=data,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            job_id = result.get("job_id")
+            if not job_id:
+                raise GPUClusterError(
+                    f"GPU cluster did not return a job_id: {result}"
                 )
-                await asyncio.sleep(wait)
-            else:
-                logger.error("GPU cluster unreachable after %d attempts: %s", MAX_CONNECT_RETRIES, e)
+            logger.info("Submitted multi-view job %s to GPU cluster", job_id)
+            return job_id
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", e.response.text)
+        except Exception:
+            detail = e.response.text
+        raise GPUClusterError(
+            f"GPU cluster returned {e.response.status_code}: {detail}"
+        ) from e
+    except httpx.RequestError as e:
+        raise GPUClusterError(
+            f"Could not connect to GPU cluster at {url}: {e}"
+        ) from e
+    finally:
+        # Close file handles
+        for _name, (_, fh, _mime) in files.items():
+            fh.close()
 
-        except httpx.TimeoutException as e:
-            raise GPUClusterError(
-                f"GPU cluster at {gpu_url} timed out while uploading views. "
-                f"The server may be overloaded or the connection is too slow."
-            ) from e
 
-        except httpx.HTTPStatusError as e:
-            raise GPUClusterError(
-                f"GPU cluster at {gpu_url} rejected the request: HTTP {e.response.status_code}. "
-                f"Response: {e.response.text[:500]}"
-            ) from e
-
-    # All retries exhausted
-    raise GPUClusterError(
-        f"Cannot connect to GPU cluster at {gpu_url}. "
-        f"Please verify the GPU server is running and GPU_CLUSTER_URL is correct. "
-        f"You can check GPU status at GET /api/health"
-    )
+# ──────────────────────────────────────────────────────────────────────
+# Polling
+# ──────────────────────────────────────────────────────────────────────
 
 
 async def poll_gpu_job(
     job_id: str,
-    on_progress: Optional[Callable[[str, int], None]] = None,
-    poll_interval: float = 3.0,
-    timeout: float = 600.0,
+    on_progress: Optional[callable] = None,
+    poll_interval: float = POLL_INTERVAL_SECONDS,
+    timeout: float = POLL_TIMEOUT_SECONDS,
 ) -> dict:
-    """Poll GPU cluster job until completion.
+    """Poll a GPU cluster job until completion or failure.
 
     Args:
-        job_id: GPU cluster job ID.
-        on_progress: Callback(status_str, progress_int).
+        job_id: Job ID to poll.
+        on_progress: Optional callback(status_str, progress_int).
         poll_interval: Seconds between polls.
-        timeout: Max seconds to wait.
+        timeout: Maximum seconds to wait.
 
     Returns:
         Final job status dict.
 
     Raises:
-        GPUClusterError: If job fails, times out, or cluster becomes unreachable.
+        GPUClusterError: If the job fails or times out.
     """
-    gpu_url = config.GPU_CLUSTER_URL
+    url = config.GPU_CLUSTER_URL.rstrip("/")
     elapsed = 0.0
-    consecutive_errors = 0
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         while elapsed < timeout:
+            try:
+                resp = await client.get(f"{url}/api/job/{job_id}/status")
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.warning("Poll error for job %s: %s", job_id, e)
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                continue
+
+            status = data.get("status", "unknown")
+            progress = data.get("progress", 0)
+
+            if on_progress:
+                on_progress(status, progress)
+
+            if status == "completed":
+                logger.info("GPU job %s completed", job_id)
+                return data
+
+            if status == "failed":
+                error = data.get("error", "Unknown error")
+                raise GPUClusterError(
+                    f"GPU job {job_id} failed: {error}"
+                )
+
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
-            try:
-                resp = await client.get(f"{gpu_url}/api/job/{job_id}/status")
-                resp.raise_for_status()
-                data = resp.json()
-                consecutive_errors = 0  # Reset on success
-
-                status = data.get("status", "")
-                progress = data.get("progress", 0)
-
-                if on_progress:
-                    on_progress(status, progress)
-
-                if status == "completed":
-                    return data
-                elif status == "failed":
-                    error = data.get("error", "Unknown error")
-                    raise GPUClusterError(f"GPU reconstruction failed: {error}")
-
-            except httpx.ConnectError:
-                consecutive_errors += 1
-                if consecutive_errors >= 5:
-                    raise GPUClusterError(
-                        f"Lost connection to GPU cluster at {gpu_url} while polling job {job_id}. "
-                        f"The server may have gone down."
-                    )
-                logger.warning(
-                    "GPU cluster poll connection error (attempt %d/5), will retry",
-                    consecutive_errors,
-                )
-
-            except httpx.TimeoutException:
-                consecutive_errors += 1
-                if consecutive_errors >= 5:
-                    raise GPUClusterError(
-                        f"GPU cluster at {gpu_url} repeatedly timed out while polling job {job_id}."
-                    )
-
-    raise GPUClusterError(f"GPU job {job_id} timed out after {timeout}s")
+    raise GPUClusterError(
+        f"GPU job {job_id} timed out after {timeout}s"
+    )
 
 
-async def download_glb(job_id: str, output_path: str) -> str:
-    """Download the GLB output from a completed GPU cluster job.
+# ──────────────────────────────────────────────────────────────────────
+# Preview fetching
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def get_preprocessing_previews(job_id: str) -> dict[str, str]:
+    """Fetch preview image URLs from the GPU cluster.
 
     Returns:
-        Path to the downloaded GLB file.
+        Dict mapping preview name → URL path (relative to GPU cluster).
+    """
+    url = config.GPU_CLUSTER_URL.rstrip("/")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{url}/api/job/{job_id}/previews")
+        resp.raise_for_status()
+        data = resp.json()
+
+    previews: dict[str, str] = {}
+
+    # Multi-view format: {views: {view_name: [{stage, url}, ...]}}
+    views = data.get("views", {})
+    for view_name, stages in views.items():
+        for stage_info in stages:
+            stage = stage_info.get("stage", "")
+            preview_url = stage_info.get("url", "")
+            if preview_url:
+                key = f"{stage}_{view_name}"
+                # Return the full URL so the backend can proxy or redirect
+                previews[key] = f"{url}{preview_url}"
+
+    return previews
+
+
+# ──────────────────────────────────────────────────────────────────────
+# GLB download
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def download_glb(job_id: str, output_path: str) -> None:
+    """Download the final GLB output from the GPU cluster.
+
+    Args:
+        job_id: Completed job ID.
+        output_path: Local path to save the GLB file.
 
     Raises:
         GPUClusterError: If download fails.
     """
-    gpu_url = config.GPU_CLUSTER_URL
+    url = config.GPU_CLUSTER_URL.rstrip("/")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            resp = await client.get(f"{gpu_url}/api/job/{job_id}/output")
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(f"{url}/api/job/{job_id}/output")
             resp.raise_for_status()
-
-            out = Path(output_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
             with open(out, "wb") as f:
                 f.write(resp.content)
-
-            logger.info("Downloaded GLB to %s (%d bytes)", out, len(resp.content))
-            return str(out)
-
-    except httpx.ConnectError as e:
-        raise GPUClusterError(
-            f"Cannot connect to GPU cluster at {gpu_url} to download GLB. "
-            f"The server may have gone down."
-        ) from e
+        logger.info("Downloaded GLB for job %s → %s", job_id, output_path)
     except httpx.HTTPStatusError as e:
         raise GPUClusterError(
-            f"Failed to download GLB from GPU cluster: HTTP {e.response.status_code}"
+            f"Failed to download GLB: HTTP {e.response.status_code}"
+        ) from e
+    except httpx.RequestError as e:
+        raise GPUClusterError(
+            f"Failed to download GLB from {url}: {e}"
         ) from e
 
-
-async def get_preprocessing_previews(job_id: str) -> dict[str, str]:
-    """Fetch preprocessing preview URLs from GPU cluster.
-
-    Returns:
-        Dict mapping preview name -> URL.
-    """
-    gpu_url = config.GPU_CLUSTER_URL
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            resp = await client.get(f"{gpu_url}/api/job/{job_id}/previews")
-            resp.raise_for_status()
-            data = resp.json()
-
-            previews = {}
-            # For multi-view jobs, previews are organized by view
-            if "views" in data:
-                for view_name, stages in data["views"].items():
-                    for stage_info in stages:
-                        key = f"{stage_info['stage']}_{view_name}"
-                        previews[key] = f"{gpu_url}{stage_info['url']}"
-            # For single-view jobs
-            elif "previews" in data:
-                for preview in data["previews"]:
-                    previews[preview["stage"]] = f"{gpu_url}{preview['url']}"
-
-            return previews
-
-    except (httpx.ConnectError, httpx.TimeoutException) as e:
-        logger.warning("Failed to fetch preprocessing previews: %s", e)
-        return {}

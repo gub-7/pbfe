@@ -17,7 +17,7 @@ class Config:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     IMAGE_GEN_MODEL: str = os.getenv("IMAGE_GEN_MODEL", "gpt-image-1")
 
-    # GPU Cluster (5 views → 3D GLB)
+    # GPU Cluster (3 views → 3D GLB)
     GPU_CLUSTER_URL: str = os.getenv("GPU_CLUSTER_URL", "http://localhost:8001")
 
     # Rubric (GLB → LEGO LDR)
