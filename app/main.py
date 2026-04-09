@@ -20,6 +20,7 @@ from .models import (
     RebrickRequest,
 )
 from .pipeline import PipelineManager
+from . import gpu_client
 
 # ──────────────────────────────────────────────────────────────────────
 # Logging
@@ -70,7 +71,11 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    gpu_health = await gpu_client.check_gpu_health()
+    return {
+        "status": "healthy",
+        "gpu_cluster": gpu_health,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────

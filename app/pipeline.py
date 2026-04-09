@@ -207,11 +207,24 @@ class PipelineManager:
 
     async def _reconstruct_3d(self, state: PipelineState):
         from . import gpu_client
+        from .gpu_client import GPUClusterError
 
-        # Preprocessing phase
+        # Pre-flight: check GPU cluster connectivity
         state.update(
             stage=PipelineStage.PREPROCESSING_3D,
             progress=32,
+            stage_message="Checking GPU cluster connectivity...",
+        )
+
+        gpu_health = await gpu_client.check_gpu_health()
+        if gpu_health["status"] != "healthy":
+            raise GPUClusterError(
+                f"GPU cluster is {gpu_health['status']} at {gpu_health['url']}. "
+                f"{gpu_health.get('detail', '')} "
+                f"Please ensure the GPU server is running and GPU_CLUSTER_URL is set correctly in your .env file."
+            )
+
+        state.update(
             stage_message="Uploading views for 3D preprocessing...",
         )
 
