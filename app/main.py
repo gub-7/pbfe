@@ -190,6 +190,25 @@ async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest)
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/pipeline/{pipeline_id}/calibrate_sweep")
+async def calibrate_sweep(pipeline_id: str):
+    """Brute-force sweep all camera orientation combos per view."""
+    state = pipeline_mgr.get_pipeline(pipeline_id)
+    if not state:
+        raise HTTPException(404, "Pipeline not found")
+    if not state.gpu_job_id:
+        raise HTTPException(400, "3D reconstruction has not started yet")
+
+    try:
+        result = await gpu_client.calibrate_sweep(state.gpu_job_id)
+        return result
+    except gpu_client.GPUClusterError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:
+        logger.error("Calibration sweep failed for pipeline %s: %s", pipeline_id, e)
+        raise HTTPException(500, str(e))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Artifact downloads
 # ──────────────────────────────────────────────────────────────────────

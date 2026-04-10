@@ -330,3 +330,38 @@ async def calibrate_cameras(job_id: str, params: dict) -> dict:
         raise GPUClusterError(
             f"Could not connect to GPU cluster for calibration: {e}"
         ) from e
+
+
+async def calibrate_sweep(job_id: str, params: dict = None) -> dict:
+    """Run brute-force calibration sweep on the GPU cluster.
+
+    Args:
+        job_id: GPU cluster job ID.
+        params: Optional sweep params (grid_resolution, etc.)
+
+    Returns:
+        Dict with per-view contact sheet PNGs (base64).
+    """
+    url = config.GPU_CLUSTER_URL.rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(
+                f"{url}/api/job/{job_id}/calibrate_sweep",
+                json=params or {},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", e.response.text)
+        except Exception:
+            detail = e.response.text
+        raise GPUClusterError(
+            f"Calibration sweep failed (HTTP {e.response.status_code}): {detail}"
+        ) from e
+    except httpx.RequestError as e:
+        raise GPUClusterError(
+            f"Could not connect to GPU cluster for sweep: {e}"
+        ) from e
