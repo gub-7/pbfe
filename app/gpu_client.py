@@ -290,16 +290,19 @@ async def download_glb(job_id: str, output_path: str) -> None:
         ) from e
 
 # ──────────────────────────────────────────────────────────────────────
-# Camera calibration
+# Camera calibration (standalone — sends images directly)
 # ──────────────────────────────────────────────────────────────────────
 
 
-async def calibrate_cameras(job_id: str, params: dict) -> dict:
+async def calibrate_cameras(image_paths: dict[str, str], params: dict) -> dict:
     """Run a fast camera calibration preview on the GPU cluster.
 
+    Sends the view images directly — no GPU pipeline job required.
+
     Args:
-        job_id: GPU cluster job ID (must have completed preprocess_views).
-        params: Camera calibration parameters (cameras, top_up_hint, etc.)
+        image_paths: Dict mapping view name → local file path.
+            Expected keys: front, side, top.
+        params: Camera calibration parameters (cameras, grid_resolution, etc.)
 
     Returns:
         Dict with preview (base64), depth_maps, overlays, n_occupied, etc.
@@ -309,11 +312,29 @@ async def calibrate_cameras(job_id: str, params: dict) -> dict:
     """
     url = config.GPU_CLUSTER_URL.rstrip("/")
 
+    files = {}
+    for view_name in CANONICAL_VIEWS:
+        path = image_paths.get(view_name)
+        if not path:
+            raise GPUClusterError(f"Missing required view '{view_name}'")
+        filepath = Path(path)
+        if not filepath.exists():
+            raise GPUClusterError(f"View file not found: {path}")
+        files[view_name] = (
+            filepath.name,
+            open(filepath, "rb"),
+            "image/png",
+        )
+
+    import json as _json
+    data = {"params": _json.dumps(params)}
+
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
-                f"{url}/api/job/{job_id}/calibrate_cameras",
-                json=params,
+                f"{url}/api/calibrate_cameras",
+                files=files,
+                data=data,
             )
             resp.raise_for_status()
             return resp.json()
@@ -330,13 +351,19 @@ async def calibrate_cameras(job_id: str, params: dict) -> dict:
         raise GPUClusterError(
             f"Could not connect to GPU cluster for calibration: {e}"
         ) from e
+    finally:
+        for _name, (_, fh, _mime) in files.items():
+            fh.close()
 
 
-async def calibrate_sweep(job_id: str, params: dict = None) -> dict:
+async def calibrate_sweep(image_paths: dict[str, str], params: dict = None) -> dict:
     """Run brute-force calibration sweep on the GPU cluster.
 
+    Sends the view images directly — no GPU pipeline job required.
+
     Args:
-        job_id: GPU cluster job ID.
+        image_paths: Dict mapping view name → local file path.
+            Expected keys: front, side, top.
         params: Optional sweep params (grid_resolution, etc.)
 
     Returns:
@@ -344,11 +371,34 @@ async def calibrate_sweep(job_id: str, params: dict = None) -> dict:
     """
     url = config.GPU_CLUSTER_URL.rstrip("/")
 
+    files = {}
+    for view_name in CANONICAL_VIEWS:
+        path = image_paths.get(view_name)
+        if not path:
+            raise GPUClusterError(f"Missing required view '{view_name}'")
+        filepath = Path(path)
+        if not filepath.exists():
+            raise GPUClusterError(f"View file not found: {path}")
+        files[view_name] = (
+            filepath.name,
+            open(filepath, "rb"),
+            "image/png",
+        )
+
+    # Send optional params as form fields
+    form_data = {}
+    if params:
+        for key in ("grid_resolution", "grid_half_extent", "sensor_width_mm",
+                     "consensus_ratio", "mask_dilation"):
+            if key in params:
+                form_data[key] = str(params[key])
+
     try:
         async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
-                f"{url}/api/job/{job_id}/calibrate_sweep",
-                json=params or {},
+                f"{url}/api/calibrate_sweep",
+                files=files,
+                data=form_data,
             )
             resp.raise_for_status()
             return resp.json()
@@ -365,3 +415,6 @@ async def calibrate_sweep(job_id: str, params: dict = None) -> dict:
         raise GPUClusterError(
             f"Could not connect to GPU cluster for sweep: {e}"
         ) from e
+    finally:
+        for _name, (_, fh, _mime) in files.items():
+            fh.close()

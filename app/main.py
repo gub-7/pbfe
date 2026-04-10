@@ -142,8 +142,37 @@ async def rebrick_pipeline(pipeline_id: str, request: RebrickRequest):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Camera calibration
+# Camera calibration (sends view images directly to GPU cluster)
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _get_view_image_paths(state) -> dict[str, str]:
+    """Extract view image paths from pipeline state.
+
+    Works whether the pipeline has a gpu_job_id or not — we only need
+    the locally-generated view images.
+
+    Returns:
+        Dict mapping view name → local file path.
+
+    Raises:
+        HTTPException 400 if views are not yet available.
+    """
+    if not state.generated_views:
+        raise HTTPException(400, "Views have not been generated yet")
+
+    paths: dict[str, str] = {}
+    for view_name in ["front", "side", "top"]:
+        path = state.generated_views.get(view_name)
+        if not path or not Path(path).exists():
+            raise HTTPException(
+                400,
+                f"View '{view_name}' not available. "
+                f"Wait for view generation to complete.",
+            )
+        paths[view_name] = path
+
+    return paths
 
 
 class CameraCalibrationRequest(BaseModel):
@@ -159,6 +188,9 @@ class CameraCalibrationRequest(BaseModel):
 async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest):
     """Run fast camera calibration preview with overridden camera params.
 
+    Sends the generated view images directly to the GPU cluster.
+    Does NOT require the GPU pipeline to have run.
+
     The ``cameras`` dict supports per-view keys:
         yaw_deg, pitch_deg, distance, focal_length,
         up_hint ([x,y,z]), rotation_deg (0/90/180/270),
@@ -167,12 +199,12 @@ async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest)
     state = pipeline_mgr.get_pipeline(pipeline_id)
     if not state:
         raise HTTPException(404, "Pipeline not found")
-    if not state.gpu_job_id:
-        raise HTTPException(400, "3D reconstruction has not started yet")
+
+    image_paths = _get_view_image_paths(state)
 
     try:
         result = await gpu_client.calibrate_cameras(
-            state.gpu_job_id,
+            image_paths,
             {
                 "cameras": request.cameras,
                 "grid_resolution": request.grid_resolution,
@@ -192,15 +224,19 @@ async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest)
 
 @app.post("/api/pipeline/{pipeline_id}/calibrate_sweep")
 async def calibrate_sweep(pipeline_id: str):
-    """Brute-force sweep all camera orientation combos per view."""
+    """Brute-force sweep all camera orientation combos per view.
+
+    Sends the generated view images directly to the GPU cluster.
+    Does NOT require the GPU pipeline to have run.
+    """
     state = pipeline_mgr.get_pipeline(pipeline_id)
     if not state:
         raise HTTPException(404, "Pipeline not found")
-    if not state.gpu_job_id:
-        raise HTTPException(400, "3D reconstruction has not started yet")
+
+    image_paths = _get_view_image_paths(state)
 
     try:
-        result = await gpu_client.calibrate_sweep(state.gpu_job_id)
+        result = await gpu_client.calibrate_sweep(image_paths)
         return result
     except gpu_client.GPUClusterError as e:
         raise HTTPException(502, str(e))
