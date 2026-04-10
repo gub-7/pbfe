@@ -148,15 +148,22 @@ async def rebrick_pipeline(pipeline_id: str, request: RebrickRequest):
 
 class CameraCalibrationRequest(BaseModel):
     cameras: dict = {}
-    top_up_hint: list[float] | None = None
     grid_resolution: int = 64
+    grid_half_extent: float = 1.0
+    sensor_width_mm: float = 36.0
     consensus_ratio: float = 0.6
     mask_dilation: int = 15
 
 
 @app.post("/api/pipeline/{pipeline_id}/calibrate_cameras")
 async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest):
-    """Run fast camera calibration preview with overridden camera params."""
+    """Run fast camera calibration preview with overridden camera params.
+
+    The ``cameras`` dict supports per-view keys:
+        yaw_deg, pitch_deg, distance, focal_length,
+        up_hint ([x,y,z]), rotation_deg (0/90/180/270),
+        flip_h (bool), flip_v (bool).
+    """
     state = pipeline_mgr.get_pipeline(pipeline_id)
     if not state:
         raise HTTPException(404, "Pipeline not found")
@@ -168,8 +175,9 @@ async def calibrate_cameras(pipeline_id: str, request: CameraCalibrationRequest)
             state.gpu_job_id,
             {
                 "cameras": request.cameras,
-                "top_up_hint": request.top_up_hint,
                 "grid_resolution": request.grid_resolution,
+                "grid_half_extent": request.grid_half_extent,
+                "sensor_width_mm": request.sensor_width_mm,
                 "consensus_ratio": request.consensus_ratio,
                 "mask_dilation": request.mask_dilation,
             },
